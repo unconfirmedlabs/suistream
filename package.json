@@ -1,0 +1,33 @@
+{
+  "name": "@unconfirmed/suistream",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ordered Sui checkpoints from the suistream SSE gateway",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "bun": "./packages/suistream/src/index.ts",
+      "types": "./packages/suistream/dist/index.d.ts",
+      "default": "./packages/suistream/dist/index.js"
+    }
+  },
+  "files": [
+    "packages/suistream/src",
+    "packages/suistream/dist"
+  ],
+  "scripts": {
+    "prepare": "tsc -p packages/suistream/tsconfig.build.json",
+    "test": "bun test packages/suistream/test",
+    "test:live": "SUISTREAM_LIVE=1 bun test packages/suistream/test/live.test.ts --timeout 900000",
+    "typecheck": "tsc -p packages/suistream --noEmit"
+  },
+  "dependencies": {
+    "@mysten/sui": "^2.36.0",
+    "effect": "^4.0.4"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.3",
+    "typescript": "^7.0.2"
+  }
+}

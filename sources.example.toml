@@ -1,0 +1,19 @@
+# Upstream checkpoint sources (example). Each ingester process runs exactly one
+# source, selected by its first argument. The ingester reads this file from
+# SOURCES_FILE (default /etc/checkpoint-stream/sources.toml); it is not baked
+# into the image. Header values may reference environment variables as ${NAME}.
+
+# An authenticated provider (token from the environment).
+[sources.provider]
+url = "https://example.sui-mainnet.provider.example:443"
+headers = { x-token = "${PROVIDER_TOKEN}" }
+
+# Your own fullnode. Rotate before the server's max connection age, if any.
+[sources.own]
+url = "https://fullnode.example.com:443"
+reconnect_before = "235m"
+
+# Mysten's public fullnode resets streams every ~28s; rotate before that.
+[sources.mysten]
+url = "https://fullnode.mainnet.sui.io:443"
+reconnect_before = "25s"

@@ -1,0 +1,24 @@
+[package]
+name = "checkpoint-probe"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Phase 0 measurement tool and end-to-end comparison client. Not deployed.
+
+[dependencies]
+common.workspace = true
+ingester = { path = "../ingester", package = "checkpoint-ingester" }
+anyhow.workspace = true
+bytes.workspace = true
+flate2 = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "zstd", "gzip"] }
+futures.workspace = true
+prost.workspace = true
+serde_json.workspace = true
+sui-rpc.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+zstd.workspace = true

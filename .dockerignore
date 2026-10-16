@@ -1,0 +1,7 @@
+target/
+**/mainnet/
+*.md
+packages/
+node_modules/
+package.json
+bun.lock

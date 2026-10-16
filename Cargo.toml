@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+common = { path = "crates/common", package = "checkpoint-stream-common" }
+anyhow = "1"
+async-nats = "0.50"
+axum = "0.8"
+bytes = "1"
+futures = "0.3"
+prometheus = { version = "0.14", default-features = false }
+prost = "0.14"
+prost-types = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Server crates use the Mysten monorepo at a mainnet release tag (for
+# `sui-types`, which renders bucket checkpoints) and the sui-rpc revision that
+# tag pins, so proto types unify. The client SDK (`crates/suistream`) uses the
+# crates.io sui-rpc instead and must stay publishable.
+sui-rpc = { git = "https://github.com/MystenLabs/sui-rust-sdk.git", rev = "788907487b40bc341bd90ee26428c4098fc1e515" }
+sui-types = { git = "https://github.com/MystenLabs/sui.git", tag = "mainnet-v1.81.1" }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+toml = "0.9"
+tonic = { version = "0.14", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+zstd = "0.13"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
