@@ -190,6 +190,30 @@ while let Some(event) = sub.next().await {
 }
 ```
 
+`subscribe_raw()` yields each checkpoint's SSE `data` payload (the proto3
+JSON) as `bytes::Bytes` instead, for callers that decode it themselves or
+pass it on. It keeps every guarantee above (order, deduplication by sequence
+number, resume, typed gap events, stall timeout, backoff, terminal 4xx) and
+never parses the payload: it is not JSON- or UTF-8-validated, so a malformed
+checkpoint is delivered as is rather than retried. `data` is a slice of the
+connection's read buffer (no copy); copy it to keep only the payload alive.
+
+```rust
+use suistream::{Client, RawEvent};
+
+let mut sub = Client::builder()
+    .read_mask(["summary.bcs", "transactions.digest", "transactions.events.bcs"])
+    .build()?
+    .subscribe_raw();                                 // RawSubscription: same cursor()/last_delivered()
+while let Some(event) = sub.next().await {
+    match event? {
+        RawEvent::Checkpoint { seq, data } => decode_my_way(seq, &data), // suistream::Bytes
+        RawEvent::Gap { from, to } => eprintln!("missed {from}..={to}"),
+    }
+    save(sub.cursor());
+}
+```
+
 Other builder options: `url`, `header` (e.g. `authorization`),
 `resume_with(ResumeWith::Query)`, `stall_timeout`. `subscribe()` needs a
 Tokio runtime; dropping the `Subscription` closes the connection. Checkpoint
@@ -199,6 +223,7 @@ stays publishable).
 ```sh
 cargo run --release -p suistream --example tail -- --mask sequence_number,digest --back 500 --secs 120
 cargo test -p suistream -- --ignored        # live tests against Mainnet
+cargo bench -p suistream --bench decode     # framing and decoding cost on recorded events
 ```
 
 ### TypeScript (`packages/suistream`)
@@ -228,6 +253,15 @@ for await (const item of sub) {            // throws LiveError only on HTTP 4xx
 ```
 
 ```ts
+// Raw: same order, gaps, resume and errors; checkpoints as the SSE data string (not parsed)
+import { subscribeRaw } from "@unconfirmed/suistream";
+
+for await (const item of subscribeRaw({ resumeAfter: savedCursor })) {
+  if (item.type === "checkpoint") forward(item.seq, item.data); // proto3 JSON, as sent
+}
+```
+
+```ts
 // Effect: a Stream<StreamItem, LiveError>; the connection closes with the stream's scope
 import { Effect, Stream } from "effect";
 import { stream, SuiStream } from "@unconfirmed/suistream";
@@ -241,6 +275,11 @@ await Effect.runPromise(
 );
 // or as a service: SuiStream.stream() with Effect.provide(SuiStream.layer({ ... }))
 ```
+
+`subscribeRaw` / `streamRaw` (`Subscription<RawStreamItem>`,
+`Stream<RawStreamItem, LiveError>`) skip decoding: each checkpoint is the
+`data` payload as received. Only the SSE `id` is checked; the payload is not
+validated.
 
 Options: `url`, `readMask`, `startAt` / `resumeAfter`, `headers`,
 `stallTimeoutMs`, `resumeWith`, `onDiagnostic` (connect/disconnect events),

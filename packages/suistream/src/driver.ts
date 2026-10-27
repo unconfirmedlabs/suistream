@@ -10,7 +10,7 @@
  */
 
 import { LiveError } from "./errors.ts";
-import type { Checkpoint, LiveSource, ResumeAfter } from "./sse.ts";
+import type { Checkpoint, CheckpointLike, GapEvent, LiveSource, ResumeAfter } from "./sse.ts";
 
 /** What a subscription yields, in strict sequence order. */
 export type StreamItem =
@@ -18,13 +18,18 @@ export type StreamItem =
   /** Checkpoints `from..=to` cannot be delivered (older than the server's history, or lost). */
   | { readonly type: "gap"; readonly from: bigint; readonly to: bigint };
 
+/** What a raw subscription yields: like `StreamItem`, checkpoints as the unparsed SSE `data`. */
+export type RawStreamItem =
+  | { readonly type: "checkpoint"; readonly seq: bigint; readonly data: string }
+  | { readonly type: "gap"; readonly from: bigint; readonly to: bigint };
+
 /** Connection lifecycle, for logging and metrics. */
 export type Diagnostic =
   | { readonly type: "connect"; readonly after: ResumeAfter }
   | { readonly type: "disconnect"; readonly reason: string; readonly retryInMs: number };
 
-export interface DriverConfig {
-  readonly live: LiveSource;
+export interface DriverConfig<C extends CheckpointLike> {
+  readonly live: LiveSource<C>;
   /** First checkpoint to deliver; undefined → start at the live tip. */
   readonly startAt: bigint | undefined;
   readonly onDiagnostic?: ((d: Diagnostic) => void) | undefined;
@@ -46,7 +51,7 @@ const sleep = (ms: number, signal: AbortSignal) =>
   });
 
 /** Ordered, deduplicated items until `signal` aborts or a fatal error is thrown. */
-export async function* drive(cfg: DriverConfig, signal: AbortSignal): AsyncGenerator<StreamItem> {
+export async function* drive<C extends CheckpointLike>(cfg: DriverConfig<C>, signal: AbortSignal): AsyncGenerator<C | GapEvent> {
   // -1n = "from genesis" (the HTTP source sends `from=0`).
   let cursor: ResumeAfter = cfg.startAt === undefined ? undefined : cfg.startAt - 1n;
   let failures = 0;

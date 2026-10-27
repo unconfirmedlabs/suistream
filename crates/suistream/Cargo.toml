@@ -1,6 +1,6 @@
 [package]
 name = "suistream"
-version = "0.1.0"
+version = "0.1.1"
 description = "Client for the Sui checkpoint SSE stream (ordered, resumable, server-side history)"
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 bytes.workspace = true
 futures.workspace = true
+memchr = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "zstd", "gzip"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -22,6 +23,12 @@ tracing.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 flate2 = "1"
+# Benchmark comparison only (evaluated, not adopted for decoding).
+sonic-rs = "0.5"
 zstd.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true
+
+[[bench]]
+name = "decode"
+harness = false

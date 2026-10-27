@@ -1,130 +1,181 @@
 //! The SSE connection: an incremental `text/event-stream` parser and the
 //! reqwest-based [`Source`].
 
-use std::collections::VecDeque;
+use std::ops::Range;
 use std::time::Duration;
 
+use bytes::{Buf, Bytes, BytesMut};
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use sui_rpc::proto::sui::rpc::v2::Checkpoint;
 
 use crate::{Error, ResumeWith};
 
-/// One dispatched SSE event.
+/// One dispatched SSE event. All fields share the parser's buffer.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct RawEvent {
-    pub id: Option<String>,
-    pub event: String,
-    pub data: String,
+pub struct Frame {
+    id: Option<Bytes>,
+    event: Option<Bytes>,
+    /// The `data` lines joined with `\n`; not UTF-8 validated.
+    pub data: Bytes,
+}
+
+impl Frame {
+    /// The `id` field, if the event had one.
+    pub fn id(&self) -> Option<&[u8]> {
+        self.id.as_deref()
+    }
+
+    /// The `event` field (default `message`).
+    pub fn event(&self) -> &[u8] {
+        self.event.as_deref().unwrap_or(b"message")
+    }
 }
 
 /// Incremental SSE parser (WHATWG event-stream rules, minus `retry` handling,
-/// which is reported but not acted on).
+/// which is reported but not acted on). Lines end at LF (a CR before it is
+/// stripped). Fields are kept as ranges into one buffer, which is only cut at
+/// event boundaries, so a single-line `data` payload is never copied.
 #[derive(Default)]
-pub(crate) struct Parser {
-    buf: Vec<u8>,
+pub struct Parser {
+    buf: BytesMut,
+    /// Start of the next line in `buf`.
+    line: usize,
     /// Bytes of `buf` already scanned for a newline.
     scanned: usize,
-    current: RawEvent,
-    has_data: bool,
-    data_lines: Vec<String>,
+    id: Option<Range<usize>>,
+    event: Option<Range<usize>>,
+    data: Vec<Range<usize>>,
 }
 
 impl Parser {
-    /// Feed bytes; returns the events completed by them.
-    pub fn push(&mut self, chunk: &[u8], out: &mut Vec<RawEvent>) -> Result<(), String> {
+    /// Feed bytes; appends the events completed by them to `out`.
+    pub fn push(&mut self, chunk: &[u8], out: &mut Vec<Frame>) -> Result<(), String> {
         self.buf.extend_from_slice(chunk);
-        let mut start = 0;
-        while let Some(rel) = self.buf[self.scanned..].iter().position(|&b| b == b'\n') {
-            let end = self.scanned + rel;
-            let mut line = &self.buf[start..end];
-            if line.last() == Some(&b'\r') {
-                line = &line[..line.len() - 1];
-            }
-            let line = std::str::from_utf8(line)
-                .map_err(|e| format!("invalid UTF-8 in event stream: {e}"))?
-                .to_owned();
-            self.line(&line, out);
-            start = end + 1;
-            self.scanned = start;
+        while let Some(rel) = memchr::memchr(b'\n', &self.buf[self.scanned..]) {
+            let lf = self.scanned + rel;
+            let start = std::mem::replace(&mut self.line, lf + 1);
+            self.scanned = lf + 1;
+            let end = if lf > start && self.buf[lf - 1] == b'\r' {
+                lf - 1
+            } else {
+                lf
+            };
+            self.field(start..end, out);
         }
-        self.buf.drain(..start);
         self.scanned = self.buf.len();
+        // Nothing pending refers to the consumed lines (comments,
+        // heartbeats): drop them.
+        if self.id.is_none() && self.event.is_none() && self.data.is_empty() {
+            self.cut(self.line);
+        }
         Ok(())
     }
 
-    fn line(&mut self, line: &str, out: &mut Vec<RawEvent>) {
-        if line.is_empty() {
-            if self.has_data {
-                let mut ev = std::mem::take(&mut self.current);
-                ev.data = std::mem::take(&mut self.data_lines).join("\n");
-                if ev.event.is_empty() {
-                    ev.event = "message".to_owned();
-                }
-                out.push(ev);
+    fn field(&mut self, line: Range<usize>, out: &mut Vec<Frame>) {
+        let bytes = &self.buf[line.clone()];
+        if bytes.is_empty() {
+            if !self.data.is_empty() {
+                let frame = self.dispatch();
+                out.push(frame);
             } else {
-                self.current = RawEvent::default();
+                self.id = None;
+                self.event = None;
             }
-            self.has_data = false;
             return;
         }
-        if line.starts_with(':') {
+        if bytes[0] == b':' {
             return; // comment / heartbeat
         }
-        let (field, value) = match line.split_once(':') {
-            Some((f, v)) => (f, v.strip_prefix(' ').unwrap_or(v)),
-            None => (line, ""),
-        };
-        match field {
-            "id" => self.current.id = Some(value.to_owned()),
-            "event" => self.current.event = value.to_owned(),
-            "data" => {
-                self.has_data = true;
-                self.data_lines.push(value.to_owned());
+        let (name, value) = match memchr::memchr(b':', bytes) {
+            Some(c) => {
+                let skip = usize::from(bytes.get(c + 1) == Some(&b' '));
+                (
+                    line.start..line.start + c,
+                    line.start + c + 1 + skip..line.end,
+                )
             }
+            None => (line.clone(), line.end..line.end),
+        };
+        match &self.buf[name] {
+            b"id" => self.id = Some(value),
+            b"event" => self.event = Some(value),
+            b"data" => self.data.push(value),
             _ => {} // retry, unknown
         }
     }
+
+    /// The pending event, cutting the buffer through its blank line.
+    fn dispatch(&mut self) -> Frame {
+        let end = self.line;
+        let frozen = self.buf.split_to(end).freeze();
+        self.line = 0;
+        self.scanned -= end;
+        let data = match self.data.as_slice() {
+            [one] => frozen.slice(one.clone()),
+            lines => {
+                let len = lines.iter().map(|r| r.len() + 1).sum::<usize>() - 1;
+                let mut joined = BytesMut::with_capacity(len);
+                for (i, r) in lines.iter().enumerate() {
+                    if i > 0 {
+                        joined.extend_from_slice(b"\n");
+                    }
+                    joined.extend_from_slice(&frozen[r.clone()]);
+                }
+                joined.freeze()
+            }
+        };
+        self.data.clear();
+        Frame {
+            id: self.id.take().map(|r| frozen.slice(r)),
+            event: self.event.take().map(|r| frozen.slice(r)),
+            data,
+        }
+    }
+
+    /// Drop the first `n` bytes of the buffer (nothing may refer to them).
+    fn cut(&mut self, n: usize) {
+        self.buf.advance(n);
+        self.line -= n;
+        self.scanned -= n;
+    }
 }
 
-/// An event from one connection.
+/// An event from one connection; checkpoints are not decoded yet.
 #[derive(Debug)]
 pub(crate) enum StreamEvent {
-    Checkpoint(u64, Box<Checkpoint>),
-    Gap { from: u64, to: u64 },
+    /// Sequence number (the SSE `id`) and the `data` payload.
+    Checkpoint(u64, Bytes),
+    Gap {
+        from: u64,
+        to: u64,
+    },
 }
 
 impl StreamEvent {
-    /// Decode a raw SSE event; `Ok(None)` for event types we don't use.
-    pub fn decode(raw: RawEvent) -> Result<Option<Self>, String> {
-        match raw.event.as_str() {
-            "checkpoint" => {
-                let seq = raw
-                    .id
-                    .as_deref()
-                    .and_then(|id| id.parse::<u64>().ok())
-                    .ok_or_else(|| format!("checkpoint event id {:?}", raw.id))?;
-                let cp: Checkpoint = serde_json::from_str(&raw.data)
-                    .map_err(|e| format!("checkpoint {seq} JSON: {e}"))?;
-                if cp.sequence_number.is_some_and(|s| s != seq) {
-                    return Err(format!(
-                        "event id {seq} != sequenceNumber {:?}",
-                        cp.sequence_number
-                    ));
-                }
-                Ok(Some(Self::Checkpoint(seq, Box::new(cp))))
+    /// Classify a frame; `Ok(None)` for event types we don't use.
+    pub fn from_frame(frame: Frame) -> Result<Option<Self>, String> {
+        match frame.event() {
+            b"checkpoint" => {
+                let seq = frame.id().and_then(parse_seq).ok_or_else(|| {
+                    format!(
+                        "checkpoint event id {:?}",
+                        frame.id().map(String::from_utf8_lossy)
+                    )
+                })?;
+                Ok(Some(Self::Checkpoint(seq, frame.data)))
             }
-            "gap" => {
+            b"gap" => {
                 #[derive(serde::Deserialize)]
                 struct Gap {
                     from: u64,
                     to: u64,
                 }
-                let g: Gap = serde_json::from_str(&raw.data)
-                    .map_err(|e| format!("gap JSON {:?}: {e}", raw.data))?;
+                let g: Gap = serde_json::from_slice(&frame.data).map_err(|e| {
+                    format!("gap JSON {:?}: {e}", String::from_utf8_lossy(&frame.data))
+                })?;
                 Ok(Some(Self::Gap {
                     from: g.from,
                     to: g.to,
@@ -133,6 +184,14 @@ impl StreamEvent {
             _ => Ok(None),
         }
     }
+}
+
+/// A sequence number: ASCII digits only.
+fn parse_seq(id: &[u8]) -> Option<u64> {
+    if id.is_empty() || !id.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(id).ok()?.parse().ok()
 }
 
 /// Why a connection ended or failed.
@@ -271,19 +330,22 @@ impl Source for HttpSource {
 
 /// Turn a body into events, failing on `stall` without any bytes.
 pub(crate) fn events(
-    body: BoxStream<'static, Result<bytes::Bytes, String>>,
+    body: BoxStream<'static, Result<Bytes, String>>,
     stall: Duration,
 ) -> EventStream {
     struct State {
-        body: BoxStream<'static, Result<bytes::Bytes, String>>,
+        body: BoxStream<'static, Result<Bytes, String>>,
         parser: Parser,
-        ready: VecDeque<RawEvent>,
+        /// Frames parsed from the last chunk; `ready[next..]` are pending.
+        ready: Vec<Frame>,
+        next: usize,
         done: bool,
     }
     let state = State {
         body,
         parser: Parser::default(),
-        ready: VecDeque::new(),
+        ready: Vec::new(),
+        next: 0,
         done: false,
     };
     futures::stream::unfold(state, move |mut st| async move {
@@ -291,8 +353,10 @@ pub(crate) fn events(
             if st.done {
                 return None;
             }
-            while let Some(raw) = st.ready.pop_front() {
-                match StreamEvent::decode(raw) {
+            while let Some(frame) = st.ready.get_mut(st.next) {
+                let frame = std::mem::take(frame);
+                st.next += 1;
+                match StreamEvent::from_frame(frame) {
                     Ok(Some(ev)) => return Some((Ok(ev), st)),
                     Ok(None) => {}
                     Err(e) => {
@@ -301,6 +365,8 @@ pub(crate) fn events(
                     }
                 }
             }
+            st.ready.clear();
+            st.next = 0;
             let chunk = match tokio::time::timeout(stall, st.body.next()).await {
                 Err(_) => {
                     st.done = true;
@@ -314,12 +380,10 @@ pub(crate) fn events(
                 }
                 Ok(Some(Ok(c))) => c,
             };
-            let mut out = Vec::new();
-            if let Err(e) = st.parser.push(&chunk, &mut out) {
+            if let Err(e) = st.parser.push(&chunk, &mut st.ready) {
                 st.done = true;
                 return Some((Err(ConnError::Retry(e, None)), st));
             }
-            st.ready.extend(out);
         }
     })
     .boxed()
@@ -329,13 +393,21 @@ pub(crate) fn events(
 mod tests {
     use super::*;
 
-    fn parse_chunks(chunks: &[&[u8]]) -> Vec<RawEvent> {
+    fn parse_chunks(chunks: &[&[u8]]) -> Vec<Frame> {
         let mut p = Parser::default();
         let mut out = vec![];
         for c in chunks {
             p.push(c, &mut out).unwrap();
         }
         out
+    }
+
+    fn frame(id: Option<&'static str>, event: Option<&'static str>, data: &'static str) -> Frame {
+        Frame {
+            id: id.map(|s| Bytes::from_static(s.as_bytes())),
+            event: event.map(|s| Bytes::from_static(s.as_bytes())),
+            data: Bytes::from_static(data.as_bytes()),
+        }
     }
 
     #[test]
@@ -345,16 +417,8 @@ mod tests {
         assert_eq!(
             whole,
             vec![
-                RawEvent {
-                    id: Some("5".into()),
-                    event: "checkpoint".into(),
-                    data: "{\"sequenceNumber\":\"5\"}".into()
-                },
-                RawEvent {
-                    id: None,
-                    event: "gap".into(),
-                    data: "{\"from\":6,\"to\":9}".into()
-                },
+                frame(Some("5"), Some("checkpoint"), "{\"sequenceNumber\":\"5\"}"),
+                frame(None, Some("gap"), "{\"from\":6,\"to\":9}"),
             ]
         );
         // Every split point, including byte-by-byte.
@@ -373,55 +437,97 @@ mod tests {
     fn crlf_multiline_and_defaults() {
         let out = parse_chunks(&[b"data: a\r\ndata:b\r\n\r\nid\ndata\n\n"]);
         assert_eq!(out[0].data, "a\nb");
-        assert_eq!(out[0].event, "message");
-        assert_eq!(out[1].id.as_deref(), Some(""));
+        assert_eq!(out[0].event(), b"message");
+        assert_eq!(out[1].id(), Some(&b""[..]));
         assert_eq!(out[1].data, "");
         // An event without data is not dispatched.
         assert!(parse_chunks(&[b"id: 1\nevent: checkpoint\n\n"]).is_empty());
+        // CR at the end of one chunk, LF at the start of the next.
+        let out = parse_chunks(&[b"id: 1\r", b"\ndata: x\r", b"\n\r", b"\n"]);
+        assert_eq!(out, [frame(Some("1"), None, "x")]);
+        // A lone CR is not a line end.
+        let out = parse_chunks(&[b"data: a\rb\n\n"]);
+        assert_eq!(out[0].data, "a\rb");
+        // One optional space after the colon; a colon in the value stays.
+        let out = parse_chunks(&[b"data:  a: b\n\n"]);
+        assert_eq!(out[0].data, " a: b");
     }
 
     #[test]
-    fn decodes_checkpoint_and_gap() {
-        let ev = StreamEvent::decode(RawEvent {
-            id: Some("7".into()),
-            event: "checkpoint".into(),
-            data: r#"{"sequenceNumber":"7","digest":"abc"}"#.into(),
-        })
-        .unwrap()
-        .unwrap();
-        let StreamEvent::Checkpoint(7, cp) = ev else {
-            panic!("{ev:?}")
-        };
-        assert_eq!(cp.digest.as_deref(), Some("abc"));
-        assert_eq!(cp.sequence_number, Some(7));
-        let ev = StreamEvent::decode(RawEvent {
-            id: None,
-            event: "gap".into(),
-            data: r#"{"from":1,"to":3}"#.into(),
-        })
-        .unwrap();
-        assert!(matches!(ev, Some(StreamEvent::Gap { from: 1, to: 3 })));
-        assert!(
-            StreamEvent::decode(RawEvent {
-                id: None,
-                event: "checkpoint".into(),
-                data: "{}".into()
-            })
-            .is_err()
+    fn id_and_event_reset_at_each_blank_line() {
+        let out = parse_chunks(&[
+            b"id: 1\nevent: x\n\ndata: a\n\nid: 2\nid: 3\nevent: y\nretry: 5\nfoo: z\ndata: b\n\ndata: c\n\n",
+        ]);
+        assert_eq!(
+            out,
+            [
+                // The blank line without data discarded id 1 and event x.
+                frame(None, None, "a"),
+                // The last value wins; unknown fields are ignored.
+                frame(Some("3"), Some("y"), "b"),
+                // Dispatch resets them too.
+                frame(None, None, "c"),
+            ]
         );
-        assert!(
-            StreamEvent::decode(RawEvent {
-                id: Some("8".into()),
-                event: "checkpoint".into(),
-                data: r#"{"sequenceNumber":"9"}"#.into()
-            })
-            .is_err()
+    }
+
+    #[test]
+    fn long_line_in_small_chunks() {
+        let payload = "x".repeat(1 << 20);
+        let stream = format!("id: 9\nevent: checkpoint\ndata: {payload}\n\n");
+        let chunks: Vec<&[u8]> = stream.as_bytes().chunks(1024).collect();
+        let out = parse_chunks(&chunks);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            (out[0].id(), out[0].event()),
+            (Some(&b"9"[..]), &b"checkpoint"[..])
         );
+        assert_eq!(out[0].data, payload.as_bytes());
+    }
+
+    #[test]
+    fn single_data_line_is_not_copied() {
+        let stream: &[u8] = b": hb\n\nid: 12\nevent: checkpoint\ndata: {\"a\":1}\n\n";
+        let at = |needle: &[u8]| stream.windows(needle.len()).position(|w| w == needle);
+        let (id_at, data_at) = (at(b"12").unwrap(), at(b"{\"a\"").unwrap());
+        for chunks in [vec![stream], stream.chunks(5).collect()] {
+            let out = parse_chunks(&chunks);
+            let (id, data) = (out[0].id().unwrap(), &out[0].data);
+            assert_eq!(data, "{\"a\":1}");
+            // Both are views of the same buffer, as far apart as in the input.
+            assert_eq!(
+                data.as_ptr() as usize - id.as_ptr() as usize,
+                data_at - id_at
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_checkpoint_and_gap() {
+        let ev = StreamEvent::from_frame(frame(Some("7"), Some("checkpoint"), "not json"));
+        assert!(matches!(ev, Ok(Some(StreamEvent::Checkpoint(7, d))) if d == "not json"));
+        let ev = StreamEvent::from_frame(frame(None, Some("gap"), r#"{"from":1,"to":3}"#));
+        assert!(matches!(ev, Ok(Some(StreamEvent::Gap { from: 1, to: 3 }))));
+        assert!(StreamEvent::from_frame(frame(None, Some("gap"), "{}")).is_err());
+        for id in [
+            None,
+            Some(""),
+            Some("x"),
+            Some("+8"),
+            Some("99999999999999999999"),
+        ] {
+            let ev = StreamEvent::from_frame(frame(id, Some("checkpoint"), "{}"));
+            assert!(ev.unwrap_err().starts_with("checkpoint event id"), "{id:?}");
+        }
+        assert!(matches!(
+            StreamEvent::from_frame(frame(Some("x"), None, "{}")),
+            Ok(None)
+        ));
     }
 
     #[tokio::test(start_paused = true)]
     async fn stall_is_an_error() {
-        let body = futures::stream::iter(vec![Ok(bytes::Bytes::from_static(
+        let body = futures::stream::iter(vec![Ok(Bytes::from_static(
             b"id: 1\nevent: checkpoint\ndata: {}\n\n",
         ))])
         .chain(futures::stream::pending())

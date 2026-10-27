@@ -8,15 +8,26 @@
  *   `lastDelivered` and `cursor`.
  * - Effect: `stream(options)` → `Stream<StreamItem, LiveError>`, or the
  *   `SuiStream` service via `SuiStream.layer(options)`.
+ * - Raw: `subscribeRaw` / `streamRaw`, the same with each checkpoint left as
+ *   the SSE `data` string (proto3 JSON, not parsed): `RawStreamItem`s.
  */
 
 import { Context, Effect, Layer, Stream } from "effect";
-import { type Diagnostic, drive, type StreamItem } from "./driver.ts";
+import { type Diagnostic, drive, type RawStreamItem, type StreamItem } from "./driver.ts";
 import { LiveError } from "./errors.ts";
 import { resolveMask } from "./mask.ts";
-import { defaultAcceptEncoding, type Fetch, httpLiveSource } from "./sse.ts";
+import {
+  type CheckpointLike,
+  type Decoder,
+  decodeEvent,
+  decodeRawEvent,
+  defaultAcceptEncoding,
+  type Fetch,
+  type GapEvent,
+  httpLiveSource,
+} from "./sse.ts";
 
-export type { Diagnostic, StreamItem } from "./driver.ts";
+export type { Diagnostic, RawStreamItem, StreamItem } from "./driver.ts";
 export { LiveError } from "./errors.ts";
 export type { Checkpoint, Fetch } from "./sse.ts";
 
@@ -61,7 +72,7 @@ const startAt = (o: SuiStreamOptions): bigint | undefined => {
 };
 
 /** A running subscription for code that does not use Effect. */
-export interface Subscription extends AsyncIterable<StreamItem> {
+export interface Subscription<T = StreamItem> extends AsyncIterable<T> {
   /** Sequence number of the last checkpoint yielded. */
   readonly lastDelivered: bigint | undefined;
   /**
@@ -74,27 +85,26 @@ export interface Subscription extends AsyncIterable<StreamItem> {
   close(): Promise<void>;
 }
 
-/**
- * Checkpoints and gaps in order, as an async iterable. A fatal error (bad
- * request, auth, unknown endpoint) is thrown as a `LiveError`; everything
- * else is retried internally. Invalid options throw a `TypeError`.
- */
-export const subscribe = (options: SuiStreamOptions = {}): Subscription => {
+/** Shared by `subscribe` and `subscribeRaw`, which differ only in how checkpoints are decoded. */
+const open = <C extends CheckpointLike>(options: SuiStreamOptions, decode: Decoder<C>): Subscription<C | GapEvent> => {
   const start = startAt(options);
   const stallTimeoutMs = options.stallTimeoutMs ?? 45_000;
   if (!(stallTimeoutMs > 0)) throw new TypeError("`stallTimeoutMs` must be positive");
   const ctrl = new AbortController();
   const items = drive(
     {
-      live: httpLiveSource({
-        url: new URL(options.url ?? MAINNET_STREAM_URL).toString(),
-        readMask: resolveMask(options.readMask),
-        headers: options.headers,
-        acceptEncoding: options.acceptEncoding ?? (options.fetch ? "gzip" : defaultAcceptEncoding()),
-        stallTimeoutMs,
-        fetch: options.fetch,
-        resumeWith: options.resumeWith,
-      }),
+      live: httpLiveSource(
+        {
+          url: new URL(options.url ?? MAINNET_STREAM_URL).toString(),
+          readMask: resolveMask(options.readMask),
+          headers: options.headers,
+          acceptEncoding: options.acceptEncoding ?? (options.fetch ? "gzip" : defaultAcceptEncoding()),
+          stallTimeoutMs,
+          fetch: options.fetch,
+          resumeWith: options.resumeWith,
+        },
+        decode,
+      ),
       startAt: start,
       onDiagnostic: options.onDiagnostic,
       backoffBaseMs: BACKOFF_BASE_MS,
@@ -109,7 +119,7 @@ export const subscribe = (options: SuiStreamOptions = {}): Subscription => {
     ctrl.abort();
     await items.return(undefined);
   };
-  const iterator: AsyncIterator<StreamItem> = {
+  const iterator: AsyncIterator<C | GapEvent> = {
     async next() {
       const r = await items.next();
       if (!r.done) {
@@ -136,16 +146,37 @@ export const subscribe = (options: SuiStreamOptions = {}): Subscription => {
 };
 
 /**
+ * Checkpoints and gaps in order, as an async iterable. A fatal error (bad
+ * request, auth, unknown endpoint) is thrown as a `LiveError`; everything
+ * else is retried internally. Invalid options throw a `TypeError`.
+ */
+export const subscribe = (options: SuiStreamOptions = {}): Subscription => open(options, decodeEvent);
+
+/**
+ * `subscribe`, with each checkpoint as the SSE `data` string, not parsed
+ * (for forwarding or storing the JSON as is). Same order, dedup, gaps,
+ * resume and errors.
+ */
+export const subscribeRaw = (options: SuiStreamOptions = {}): Subscription<RawStreamItem> => open(options, decodeRawEvent);
+
+const toStream = <T>(subscription: () => Subscription<T>): Stream.Stream<T, LiveError> =>
+  Stream.suspend(() =>
+    Stream.fromAsyncIterable(subscription(), (e) =>
+      e instanceof LiveError ? e : new LiveError({ message: String(e), fatal: true, cause: e }),
+    ),
+  );
+
+/**
  * Checkpoints and gaps in order, as an Effect `Stream` (one subscription per
  * run, closed with the stream's scope). Only fatal errors fail it; invalid
  * options are a defect.
  */
 export const stream = (options: SuiStreamOptions = {}): Stream.Stream<StreamItem, LiveError> =>
-  Stream.suspend(() =>
-    Stream.fromAsyncIterable(subscribe(options), (e) =>
-      e instanceof LiveError ? e : new LiveError({ message: String(e), fatal: true, cause: e }),
-    ),
-  );
+  toStream(() => subscribe(options));
+
+/** `stream`, with each checkpoint as the unparsed SSE `data` string (see `subscribeRaw`). */
+export const streamRaw = (options: SuiStreamOptions = {}): Stream.Stream<RawStreamItem, LiveError> =>
+  toStream(() => subscribeRaw(options));
 
 /** Effect service for apps that configure the stream once via a `Layer`. */
 export class SuiStream extends Context.Service<

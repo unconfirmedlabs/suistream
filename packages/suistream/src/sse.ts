@@ -8,10 +8,17 @@ import { LiveError } from "./errors.ts";
 
 export type Checkpoint = GrpcTypes.Checkpoint;
 
+export type GapEvent = { readonly type: "gap"; readonly from: bigint; readonly to: bigint };
+/** A checkpoint event as the driver needs it: ordered and deduplicated by `seq`. */
+export type CheckpointLike = { readonly type: "checkpoint"; readonly seq: bigint };
+export type CheckpointEvent = { readonly type: "checkpoint"; readonly seq: bigint; readonly checkpoint: Checkpoint };
+/** A checkpoint left as the SSE `data` payload (proto3 JSON, unparsed). */
+export type RawCheckpointEvent = { readonly type: "checkpoint"; readonly seq: bigint; readonly data: string };
+
 /** One event of the stream. */
-export type LiveEvent =
-  | { readonly type: "checkpoint"; readonly seq: bigint; readonly checkpoint: Checkpoint }
-  | { readonly type: "gap"; readonly from: bigint; readonly to: bigint };
+export type LiveEvent = CheckpointEvent | GapEvent;
+/** One event of the stream, checkpoints unparsed. */
+export type RawLiveEvent = RawCheckpointEvent | GapEvent;
 
 /**
  * Where a connection starts: after `seq` (`Last-Event-ID`), at genesis
@@ -20,8 +27,8 @@ export type LiveEvent =
 export type ResumeAfter = bigint | undefined;
 
 /** Opens connections. Replaceable for tests or custom transports. */
-export interface LiveSource {
-  connect(after: ResumeAfter, signal: AbortSignal): AsyncIterable<LiveEvent>;
+export interface LiveSource<C extends CheckpointLike = CheckpointEvent> {
+  connect(after: ResumeAfter, signal: AbortSignal): AsyncIterable<C | GapEvent>;
 }
 
 export interface RawSseEvent {
@@ -116,35 +123,46 @@ const parseSeq = (s: string | undefined, what: string): bigint => {
   return BigInt(s);
 };
 
-/** Decode one raw event; `undefined` for event types this SDK ignores. */
-export const decodeEvent = (raw: RawSseEvent): LiveEvent | undefined => {
-  switch (raw.event) {
-    case "checkpoint": {
-      const seq = parseSeq(raw.id, "event id");
-      let checkpoint: Checkpoint;
-      try {
-        checkpoint = GrpcTypes.Checkpoint.fromJsonString(raw.data, { ignoreUnknownFields: true });
-      } catch (cause) {
-        throw bad(`checkpoint ${seq}: undecodable JSON`, cause);
+/** Turns one raw event into an event, or `undefined` for event types this SDK ignores. */
+export type Decoder<C extends CheckpointLike> = (raw: RawSseEvent) => C | GapEvent | undefined;
+
+/** Shared by both modes: the checkpoint `id` is validated, gaps are decoded the same way. */
+const decoder =
+  <C extends CheckpointLike>(checkpoint: (seq: bigint, data: string) => C): Decoder<C> =>
+  (raw) => {
+    switch (raw.event) {
+      case "checkpoint":
+        return checkpoint(parseSeq(raw.id, "event id"), raw.data);
+      case "gap": {
+        let parsed: { from?: unknown; to?: unknown };
+        try {
+          parsed = JSON.parse(raw.data);
+        } catch (cause) {
+          throw bad(`undecodable gap event: ${raw.data}`, cause);
+        }
+        return { type: "gap", from: parseSeq(String(parsed.from), "gap.from"), to: parseSeq(String(parsed.to), "gap.to") };
       }
-      if (checkpoint.sequenceNumber !== undefined && checkpoint.sequenceNumber !== seq) {
-        throw bad(`event id ${seq} != sequenceNumber ${checkpoint.sequenceNumber}`);
-      }
-      return { type: "checkpoint", seq, checkpoint };
+      default:
+        return undefined;
     }
-    case "gap": {
-      let parsed: { from?: unknown; to?: unknown };
-      try {
-        parsed = JSON.parse(raw.data);
-      } catch (cause) {
-        throw bad(`undecodable gap event: ${raw.data}`, cause);
-      }
-      return { type: "gap", from: parseSeq(String(parsed.from), "gap.from"), to: parseSeq(String(parsed.to), "gap.to") };
-    }
-    default:
-      return undefined;
+  };
+
+/** Decode one raw event, checkpoints as `GrpcTypes.Checkpoint`. */
+export const decodeEvent: Decoder<CheckpointEvent> = decoder((seq, data) => {
+  let checkpoint: Checkpoint;
+  try {
+    checkpoint = GrpcTypes.Checkpoint.fromJsonString(data, { ignoreUnknownFields: true });
+  } catch (cause) {
+    throw bad(`checkpoint ${seq}: undecodable JSON`, cause);
   }
-};
+  if (checkpoint.sequenceNumber !== undefined && checkpoint.sequenceNumber !== seq) {
+    throw bad(`event id ${seq} != sequenceNumber ${checkpoint.sequenceNumber}`);
+  }
+  return { type: "checkpoint", seq, checkpoint };
+});
+
+/** Decode one raw event, checkpoints left as the `data` string (never parsed). */
+export const decodeRawEvent: Decoder<RawCheckpointEvent> = decoder((seq, data) => ({ type: "checkpoint", seq, data }));
 
 const atLeast = (version: string, major: number, minor: number) => {
   const [a = 0, b = 0] = version.split(".").map(Number);
@@ -191,8 +209,12 @@ export interface HttpLiveOptions {
 
 const FATAL_STATUSES = new Set([400, 401, 403, 404, 410]);
 
-/** The SSE source over HTTP. */
-export const httpLiveSource = (options: HttpLiveOptions): LiveSource => ({
+/** The SSE source over HTTP; `decode` picks typed (default) or raw checkpoints. */
+export const httpLiveSource = <C extends CheckpointLike = CheckpointEvent>(
+  options: HttpLiveOptions,
+  // The default is only used with the default `C`.
+  decode: Decoder<C> = decodeEvent as unknown as Decoder<C>,
+): LiveSource<C> => ({
   async *connect(after, signal) {
     const url = new URL(options.url);
     if (options.readMask) url.searchParams.set("read_mask", options.readMask.join(","));
@@ -266,7 +288,7 @@ export const httpLiveSource = (options: HttpLiveOptions): LiveSource => ({
           if (ctrl.signal.aborted) throw failure("aborted", ctrl.signal.reason);
           if (chunk.done) return;
           for (const raw of parser.push(chunk.value)) {
-            const event = decodeEvent(raw);
+            const event = decode(raw);
             if (event) yield event;
           }
         }
