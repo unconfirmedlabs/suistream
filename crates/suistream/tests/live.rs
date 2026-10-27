@@ -83,3 +83,50 @@ async fn resume_serves_history() {
         .count();
     eprintln!("resume from {}: {gaps} gap events", tip - 1500);
 }
+
+#[tokio::test]
+#[ignore]
+async fn raw_matches_typed() {
+    // The same 20 checkpoints (lean mask, recent history) through
+    // `subscribe_raw` and `subscribe`: same order, and the raw payload
+    // decodes to the typed checkpoint.
+    let lean = || {
+        builder().read_mask([
+            "summary.bcs",
+            "transactions.digest",
+            "transactions.events.bcs",
+        ])
+    };
+    let tip = first_seq(&take(builder().read_mask(["digest"]), 1).await);
+    let typed = take(lean().start_at(tip - 100), 20).await;
+    let mut raw = lean().start_at(tip - 100).build().unwrap().subscribe_raw();
+    for want in &typed {
+        let ev = tokio::time::timeout(Duration::from_secs(120), raw.next())
+            .await
+            .expect("progress")
+            .expect("open")
+            .expect("event");
+        match (ev, want) {
+            (
+                suistream::RawEvent::Checkpoint { seq, data },
+                Event::Checkpoint { seq: s, checkpoint },
+            ) => {
+                assert_eq!(seq, *s);
+                let decoded = suistream::__private::decode_checkpoint(seq, &data).unwrap();
+                assert_eq!(&decoded, checkpoint, "checkpoint {seq}");
+            }
+            (suistream::RawEvent::Gap { from, to }, Event::Gap { from: f, to: t }) => {
+                assert_eq!((from, to), (*f, *t));
+            }
+            (got, want) => panic!("raw {got:?} vs typed {want:?}"),
+        }
+    }
+    assert_eq!(raw.cursor(), typed_cursor(&typed));
+}
+
+fn typed_cursor(events: &[Event]) -> Option<u64> {
+    events.last().map(|e| match e {
+        Event::Checkpoint { seq, .. } => *seq,
+        Event::Gap { to, .. } => *to,
+    })
+}

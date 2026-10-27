@@ -13,6 +13,10 @@
 //!   older than its history limit) as [`Event::Gap`]; the subscription then
 //!   continues after the gap.
 //!
+//! [`Client::subscribe_raw`] gives the same guarantees but yields each
+//! checkpoint's JSON payload unparsed ([`RawEvent`]), for callers that
+//! decode it themselves or pass it on.
+//!
 //! ```no_run
 //! use futures::StreamExt;
 //! # async fn run() -> Result<(), suistream::Error> {
@@ -41,6 +45,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+pub use bytes::Bytes;
 pub use sui_rpc::proto::sui::rpc::v2::Checkpoint;
 
 /// Production Mainnet stream.
@@ -67,6 +72,18 @@ pub enum Event {
         seq: u64,
         checkpoint: Box<Checkpoint>,
     },
+    /// Checkpoints `from..=to` cannot be delivered; the stream continues
+    /// with `to + 1`.
+    Gap { from: u64, to: u64 },
+}
+
+/// One item of a [`RawSubscription`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RawEvent {
+    /// The next checkpoint. `data`: the proto3 JSON exactly as received
+    /// (zero-copy from the SSE buffer; not parsed, not UTF-8 validated). It
+    /// keeps that buffer alive: copy it to retain only the payload.
+    Checkpoint { seq: u64, data: Bytes },
     /// Checkpoints `from..=to` cannot be delivered; the stream continues
     /// with `to + 1`.
     Gap { from: u64, to: u64 },
@@ -124,13 +141,16 @@ impl Client {
     /// Start streaming. Must be called within a Tokio runtime; dropping the
     /// [`Subscription`] stops all background work.
     pub fn subscribe(&self) -> Subscription {
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let task = tokio::spawn(driver::run(self.source.clone(), self.start, tx));
         Subscription {
-            rx,
-            task,
-            last: None,
-            cursor: self.start.and_then(|s| s.checked_sub(1)),
+            inner: Sub::new(self),
+        }
+    }
+
+    /// Like [`subscribe`](Client::subscribe), but yields each checkpoint's
+    /// SSE `data` payload unparsed.
+    pub fn subscribe_raw(&self) -> RawSubscription {
+        RawSubscription {
+            inner: Sub::new(self),
         }
     }
 }
@@ -219,47 +239,89 @@ impl Builder {
 /// Ordered events. Ends only after yielding an [`Error`]. Bounded: when the
 /// consumer falls behind, reading from the network pauses.
 pub struct Subscription {
-    rx: tokio::sync::mpsc::Receiver<Result<Event, Error>>,
+    inner: Sub<Event>,
+}
+
+/// Ordered raw events, with the same guarantees as a [`Subscription`].
+pub struct RawSubscription {
+    inner: Sub<RawEvent>,
+}
+
+/// The common part of both subscriptions: the driver task and the position.
+struct Sub<E> {
+    rx: tokio::sync::mpsc::Receiver<Result<E, Error>>,
     task: tokio::task::JoinHandle<()>,
     last: Option<u64>,
     cursor: Option<u64>,
 }
 
-impl Subscription {
-    /// Sequence number of the last checkpoint yielded.
-    pub fn last_delivered(&self) -> Option<u64> {
-        self.last
+impl<E: driver::Item> Sub<E> {
+    fn new(client: &Client) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let task = tokio::spawn(driver::run(client.source.clone(), client.start, tx));
+        Self {
+            rx,
+            task,
+            last: None,
+            cursor: client.start.and_then(|s| s.checked_sub(1)),
+        }
     }
 
-    /// Everything up to and including this checkpoint has been yielded,
-    /// either as a checkpoint or inside a gap. Persist it and pass it to
-    /// [`Builder::resume_after`] to continue later.
-    pub fn cursor(&self) -> Option<u64> {
-        self.cursor
-    }
-}
-
-impl futures::Stream for Subscription {
-    type Item = Result<Event, Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<E, Error>>> {
         let item = std::task::ready!(self.rx.poll_recv(cx));
-        match &item {
-            Some(Ok(Event::Checkpoint { seq, .. })) => {
-                self.last = Some(*seq);
-                self.cursor = Some(*seq);
-            }
-            Some(Ok(Event::Gap { to, .. })) => self.cursor = Some(*to),
-            _ => {}
+        if let Some(Ok(item)) = &item {
+            let (delivered, cursor) = item.position();
+            self.last = delivered.or(self.last);
+            self.cursor = Some(cursor);
         }
         Poll::Ready(item)
     }
 }
 
-impl Drop for Subscription {
+impl<E> Drop for Sub<E> {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+macro_rules! subscription {
+    ($name:ident, $item:ty) => {
+        impl $name {
+            /// Sequence number of the last checkpoint yielded.
+            pub fn last_delivered(&self) -> Option<u64> {
+                self.inner.last
+            }
+
+            /// Everything up to and including this checkpoint has been
+            /// yielded, either as a checkpoint or inside a gap. Persist it
+            /// and pass it to [`Builder::resume_after`] to continue later.
+            pub fn cursor(&self) -> Option<u64> {
+                self.inner.cursor
+            }
+        }
+
+        impl futures::Stream for $name {
+            type Item = Result<$item, Error>;
+
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                self.inner.poll_next(cx)
+            }
+        }
+    };
+}
+
+subscription!(Subscription, Event);
+subscription!(RawSubscription, RawEvent);
+
+/// Not public API: internals exposed for benchmarks and tests. May change
+/// without notice.
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::driver::decode_checkpoint;
+    pub use crate::sse::{Frame, Parser};
 }
 
 #[cfg(test)]

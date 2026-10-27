@@ -1,5 +1,6 @@
 //! The client against a local mock gateway: resume headers, encodings,
-//! reconnects, retryable vs fatal statuses.
+//! reconnects, retryable vs fatal statuses. Each scenario runs in typed and
+//! raw mode.
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -14,7 +15,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures::StreamExt;
-use suistream::{Event, ResumeWith};
+use suistream::{Checkpoint, Event, RawEvent, ResumeWith};
 
 /// One scripted response.
 #[derive(Clone)]
@@ -125,11 +126,15 @@ impl Mock {
     }
 }
 
-fn cp(seq: u64) -> String {
+fn json(seq: u64) -> String {
     // An unknown field must be ignored (newer server protos).
     format!(
-        "id: {seq}\nevent: checkpoint\ndata: {{\"sequenceNumber\":\"{seq}\",\"digest\":\"d{seq}\",\"someFutureField\":{{\"x\":1}}}}\n\n"
+        "{{\"sequenceNumber\":\"{seq}\",\"digest\":\"d{seq}\",\"someFutureField\":{{\"x\":1}}}}"
     )
+}
+
+fn cp(seq: u64) -> String {
+    format!("id: {seq}\nevent: checkpoint\ndata: {}\n\n", json(seq))
 }
 
 fn gap(from: u64, to: u64) -> String {
@@ -143,30 +148,104 @@ fn events(seqs: &[String], hang: bool) -> Reply {
     }
 }
 
-async fn take(sub: &mut suistream::Subscription, n: usize) -> Vec<String> {
+/// A typed or raw subscription.
+enum Sub {
+    Typed(suistream::Subscription),
+    Raw(suistream::RawSubscription),
+}
+
+impl Sub {
+    fn new(builder: suistream::Builder, raw: bool) -> Self {
+        let client = builder.build().unwrap();
+        if raw {
+            Sub::Raw(client.subscribe_raw())
+        } else {
+            Sub::Typed(client.subscribe())
+        }
+    }
+
+    /// The next item as a string; checks the payload of checkpoints.
+    async fn next(&mut self) -> Option<String> {
+        let show_err = |e: suistream::Error| format!("error {e}");
+        Some(match self {
+            Sub::Typed(s) => match s.next().await? {
+                Ok(Event::Checkpoint { seq, checkpoint }) => {
+                    assert_eq!(
+                        checkpoint.digest.as_deref(),
+                        Some(format!("d{seq}").as_str())
+                    );
+                    seq.to_string()
+                }
+                Ok(Event::Gap { from, to }) => format!("gap {from}-{to}"),
+                Err(e) => show_err(e),
+            },
+            Sub::Raw(s) => match s.next().await? {
+                Ok(RawEvent::Checkpoint { seq, data }) => {
+                    assert_eq!(data, json(seq).as_bytes(), "exact bytes of {seq}");
+                    seq.to_string()
+                }
+                Ok(RawEvent::Gap { from, to }) => format!("gap {from}-{to}"),
+                Err(e) => show_err(e),
+            },
+        })
+    }
+
+    fn last_delivered(&self) -> Option<u64> {
+        match self {
+            Sub::Typed(s) => s.last_delivered(),
+            Sub::Raw(s) => s.last_delivered(),
+        }
+    }
+
+    fn cursor(&self) -> Option<u64> {
+        match self {
+            Sub::Typed(s) => s.cursor(),
+            Sub::Raw(s) => s.cursor(),
+        }
+    }
+}
+
+async fn take(sub: &mut Sub, n: usize) -> Vec<String> {
     let mut out = vec![];
     while out.len() < n {
         let ev = tokio::time::timeout(Duration::from_secs(20), sub.next())
             .await
             .expect("progress")
             .expect("open");
-        out.push(match ev {
-            Ok(Event::Checkpoint { seq, checkpoint }) => {
-                assert_eq!(
-                    checkpoint.digest.as_deref(),
-                    Some(format!("d{seq}").as_str())
-                );
-                seq.to_string()
-            }
-            Ok(Event::Gap { from, to }) => format!("gap {from}-{to}"),
-            Err(e) => format!("error {e}"),
-        });
+        out.push(ev);
     }
     out
 }
 
-#[tokio::test]
-async fn resumes_with_last_event_id_across_closes_and_gaps() {
+/// `#[tokio::test]`s `<name>` (typed) and `<name>_raw` for `async fn name(raw: bool)`.
+macro_rules! both_modes {
+    ($($name:ident),* $(,)?) => {
+        mod typed {
+            $(#[tokio::test]
+            async fn $name() {
+                super::$name(false).await
+            })*
+        }
+        mod raw {
+            $(#[tokio::test]
+            async fn $name() {
+                super::$name(true).await
+            })*
+        }
+    };
+}
+
+both_modes!(
+    resumes_with_last_event_id_across_closes_and_gaps,
+    query_resume_and_tip_start,
+    gzip_only_server,
+    retry_after_is_honoured_and_400_is_fatal,
+    stall_triggers_reconnect,
+    dropping_the_subscription_closes_the_connection,
+    slow_consumer_is_not_a_stall,
+);
+
+async fn resumes_with_last_event_id_across_closes_and_gaps(raw: bool) {
     let mock = Mock::default();
     let url = mock
         .serve(vec![
@@ -176,13 +255,13 @@ async fn resumes_with_last_event_id_across_closes_and_gaps() {
             events(&[cp(16)], true),
         ])
         .await;
-    let mut sub = suistream::Client::builder()
-        .url(url)
-        .read_mask(["sequence_number", "digest"])
-        .start_at(10)
-        .build()
-        .unwrap()
-        .subscribe();
+    let mut sub = Sub::new(
+        suistream::Client::builder()
+            .url(url)
+            .read_mask(["sequence_number", "digest"])
+            .start_at(10),
+        raw,
+    );
     assert_eq!(
         take(&mut sub, 5).await,
         ["10", "11", "12", "gap 13-15", "16"]
@@ -206,18 +285,17 @@ async fn resumes_with_last_event_id_across_closes_and_gaps() {
     }
 }
 
-#[tokio::test]
-async fn query_resume_and_tip_start() {
+async fn query_resume_and_tip_start(raw: bool) {
     let mock = Mock::default();
     let url = mock
         .serve(vec![events(&[cp(100)], false), events(&[cp(101)], true)])
         .await;
-    let mut sub = suistream::Client::builder()
-        .url(url)
-        .resume_with(ResumeWith::Query)
-        .build()
-        .unwrap()
-        .subscribe();
+    let mut sub = Sub::new(
+        suistream::Client::builder()
+            .url(url)
+            .resume_with(ResumeWith::Query),
+        raw,
+    );
     assert_eq!(take(&mut sub, 2).await, ["100", "101"]);
     let reqs = mock.requests.lock().unwrap().clone();
     assert_eq!((reqs[0].0.clone(), reqs[0].1.clone()), (None, None));
@@ -229,23 +307,21 @@ async fn query_resume_and_tip_start() {
     assert_eq!(reqs[0].2, None);
 }
 
-#[tokio::test]
-async fn gzip_only_server() {
+async fn gzip_only_server(raw: bool) {
     let mock = Mock::default();
     let url = mock.serve(vec![events(&[cp(1), cp(2)], true)]).await;
-    let mut sub = suistream::Client::builder()
-        .url(url)
-        .header("accept-encoding", "gzip")
-        .start_at(1)
-        .build()
-        .unwrap()
-        .subscribe();
+    let mut sub = Sub::new(
+        suistream::Client::builder()
+            .url(url)
+            .header("accept-encoding", "gzip")
+            .start_at(1),
+        raw,
+    );
     assert_eq!(take(&mut sub, 2).await, ["1", "2"]);
     assert_eq!(mock.requests.lock().unwrap()[0].3, "gzip");
 }
 
-#[tokio::test]
-async fn retry_after_is_honoured_and_400_is_fatal() {
+async fn retry_after_is_honoured_and_400_is_fatal(raw: bool) {
     let mock = Mock::default();
     let url = mock
         .serve(vec![
@@ -255,12 +331,7 @@ async fn retry_after_is_honoured_and_400_is_fatal() {
         ])
         .await;
     let t0 = std::time::Instant::now();
-    let mut sub = suistream::Client::builder()
-        .url(url)
-        .start_at(5)
-        .build()
-        .unwrap()
-        .subscribe();
+    let mut sub = Sub::new(suistream::Client::builder().url(url).start_at(5), raw);
     let got = take(&mut sub, 2).await;
     assert_eq!(got[0], "5");
     assert!(
@@ -271,34 +342,27 @@ async fn retry_after_is_honoured_and_400_is_fatal() {
     assert!(sub.next().await.is_none(), "ends after a fatal error");
 }
 
-#[tokio::test]
-async fn stall_triggers_reconnect() {
+async fn stall_triggers_reconnect(raw: bool) {
     let mock = Mock::default();
     // The first connection sends one checkpoint and then nothing.
     let url = mock
         .serve(vec![events(&[cp(7)], true), events(&[cp(8)], true)])
         .await;
-    let mut sub = suistream::Client::builder()
-        .url(url)
-        .start_at(7)
-        .stall_timeout(Duration::from_millis(500))
-        .build()
-        .unwrap()
-        .subscribe();
+    let mut sub = Sub::new(
+        suistream::Client::builder()
+            .url(url)
+            .start_at(7)
+            .stall_timeout(Duration::from_millis(500)),
+        raw,
+    );
     assert_eq!(take(&mut sub, 2).await, ["7", "8"]);
     assert_eq!(mock.requests.lock().unwrap()[1].0.as_deref(), Some("7"));
 }
 
-#[tokio::test]
-async fn dropping_the_subscription_closes_the_connection() {
+async fn dropping_the_subscription_closes_the_connection(raw: bool) {
     let mock = Mock::default();
     let url = mock.serve(vec![events(&[cp(1)], true)]).await;
-    let mut sub = suistream::Client::builder()
-        .url(url)
-        .start_at(1)
-        .build()
-        .unwrap()
-        .subscribe();
+    let mut sub = Sub::new(suistream::Client::builder().url(url).start_at(1), raw);
     assert_eq!(take(&mut sub, 1).await, ["1"]);
     assert_eq!(mock.closed.load(Ordering::SeqCst), 0);
     drop(sub);
@@ -313,19 +377,73 @@ async fn dropping_the_subscription_closes_the_connection() {
     assert_eq!(mock.requests.lock().unwrap().len(), 1);
 }
 
-#[tokio::test]
-async fn slow_consumer_is_not_a_stall() {
+async fn slow_consumer_is_not_a_stall(raw: bool) {
     let mock = Mock::default();
     let url = mock.serve(vec![events(&[cp(1), cp(2), cp(3)], true)]).await;
-    let mut sub = suistream::Client::builder()
-        .url(url)
-        .stall_timeout(Duration::from_millis(100))
-        .build()
-        .unwrap()
-        .subscribe();
+    let mut sub = Sub::new(
+        suistream::Client::builder()
+            .url(url)
+            .stall_timeout(Duration::from_millis(100)),
+        raw,
+    );
     for want in ["1", "2", "3"] {
         assert_eq!(take(&mut sub, 1).await, [want]);
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
     assert_eq!(mock.requests.lock().unwrap().len(), 1);
+}
+
+/// The recorded lean fixture through the mock: raw payloads are the recorded
+/// bytes, typed checkpoints their decoding.
+#[tokio::test]
+async fn serves_recorded_fixture() {
+    let path = format!("{}/tests/fixtures/lean.sse.zst", env!("CARGO_MANIFEST_DIR"));
+    let body = zstd::decode_all(std::fs::File::open(path).unwrap()).unwrap();
+    let body = String::from_utf8(body).unwrap();
+    // (seq, data) as recorded.
+    let mut want: Vec<(u64, &str)> = vec![];
+    for ev in body.split("\n\n") {
+        let field = |name: &str| {
+            ev.lines()
+                .find_map(|l| l.strip_prefix(name)?.strip_prefix(": "))
+        };
+        if let (Some(id), Some(data)) = (field("id"), field("data")) {
+            want.push((id.parse().unwrap(), data));
+        }
+    }
+    assert_eq!(want.len(), 24);
+    let mock = Mock::default();
+    let reply = Reply::Events {
+        body: body.clone(),
+        hang: true,
+    };
+    let url = mock.serve(vec![reply.clone(), reply]).await;
+    let client = suistream::Client::builder()
+        .url(url)
+        .start_at(want[0].0)
+        .build()
+        .unwrap();
+    let mut raw = client.subscribe_raw();
+    for (seq, data) in &want {
+        let ev = tokio::time::timeout(Duration::from_secs(20), raw.next()).await;
+        assert_eq!(
+            ev.unwrap().unwrap().unwrap(),
+            RawEvent::Checkpoint {
+                seq: *seq,
+                data: suistream::Bytes::copy_from_slice(data.as_bytes()),
+            }
+        );
+    }
+    let mut typed = client.subscribe();
+    for (seq, data) in &want {
+        let ev = tokio::time::timeout(Duration::from_secs(20), typed.next()).await;
+        let checkpoint: Box<Checkpoint> = serde_json::from_slice(data.as_bytes()).unwrap();
+        assert_eq!(
+            ev.unwrap().unwrap().unwrap(),
+            Event::Checkpoint {
+                seq: *seq,
+                checkpoint
+            }
+        );
+    }
 }
